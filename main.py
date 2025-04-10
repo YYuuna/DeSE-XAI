@@ -167,27 +167,27 @@ if __name__ == "__main__":
     elif args.dataset == 'Photo':
         args.epochs = 800  #800
         args.verbose = 20
-        args.beta_f = 0.5  #0.4
-        args.dropout = 0.3  #0.05
-        args.embed_dim = 32  #64
+        args.beta_f = 0.4  #0.4
+        args.dropout = 0.05  #0.05
+        args.embed_dim = 64  #64
         args.k = 1
         args.num_clusters_layer = [9]  #[9]
-        args.lp_lamda = 0.5  #5
+        args.lp_lamda = 0  #5
         args.se_lamda = 0.01  #0.01
-        args.lr = 0.001
-        args.seed = 110  #132
+        args.lr = 0.001 #0.001
+        args.seed = 132  #132
     elif args.dataset == 'Computers':   
         args.epochs = 800 #800
         args.verbose = 20
-        args.beta_f = 0.3 #0.4
-        args.dropout = 0.3
-        args.embed_dim = 8  #32
+        args.beta_f = 0.4 #0.4
+        args.dropout = 0.3 #0.3
+        args.embed_dim = 32  #32
         args.k = 1
-        args.num_clusters_layer = [11]
-        args.lp_lamda = 5  #0.5
-        args.se_lamda = 0.5  #0.2
-        args.lr = 0.005  #0.001
-        args.seed = 398  #323
+        args.num_clusters_layer = [11] #[11]
+        args.lp_lamda = 0.5  #0.5
+        args.se_lamda = 0.2  #0.2
+        args.lr = 0.001  #0.001
+        args.seed = 323  #323
     elif args.dataset == 'Pubmed':
         args.epochs = 1000
         args.verbose = 20
