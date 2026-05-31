@@ -6,6 +6,7 @@ import torch
 import torch.optim as optim
 from time import time, strftime, localtime
 import os
+import pickle
 import numpy as np
 import random
 import dgl
@@ -18,6 +19,34 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 torch.autograd.set_detect_anomaly(True)
 print(torch.cuda.is_available())
 
+def export_ccts_dataset(dataset, dataset_name, method, partition):
+    graph_dir = os.path.join('data', 'graph')
+    part_dir = os.path.join('community_partitions', method)
+    os.makedirs(graph_dir, exist_ok=True)
+    os.makedirs(part_dir, exist_ok=True)
+
+    edge_index = dataset.edge_index.cpu().numpy()
+    edges = set()
+    for u, v in edge_index.T:
+        u = int(u)
+        v = int(v)
+        if u == v:
+            continue
+        edges.add(tuple(sorted((u, v))))
+
+    graph_path = os.path.join(graph_dir, f'{dataset_name}.txt')
+    with open(graph_path, 'w', encoding='utf-8') as f:
+        for u, v in sorted(edges):
+            f.write(f"{u} {v}\n")
+
+    partition_dict = {int(i): int(int(label)) for i, label in enumerate(partition)}
+    part_path = os.path.join(part_dir, f'{dataset_name}_partition.pkl')
+    with open(part_path, 'wb') as f:
+        pickle.dump(partition_dict, f)
+
+    print(f'Exported CCTS graph to: {graph_path}')
+    print(f'Exported CCTS partition to: {part_path}')
+
 def train(args):
     #prepare graph dataset and device
     if args.gpu >= 0 and torch.cuda.is_available():
@@ -29,6 +58,7 @@ def train(args):
     dataset = Data(args.dataset, device)
     dataset.print_statistic()
     #dataset.print_degree()
+    final_pred = None
     
     best_cluster_result = {}
     best_cluster = {'nmi': -0.001, 'ari': -0.001, 'acc': -0.001, 'f1': -0.001}
@@ -39,7 +69,7 @@ def train(args):
     for epoch in range(args.epochs):
         t1 = time()
         s_dic, tree_node_embed_dic, g_dic = model(dataset.adj, dataset.feature, dataset.degrees)
-        #se_loss = model.calculate_se_loss(s_dic, g_dic[args.height])
+        se_loss = model.calculate_se_loss(s_dic, g_dic[args.height])
         t2 = time()
         se_loss = model.calculate_se_loss1()
         t3= time()
@@ -52,6 +82,7 @@ def train(args):
 
         if epoch % args.verbose == 0:
             pred = decoding_from_assignment(model.hard_dic[1])
+            final_pred = pred
             metrics = cluster_metrics(dataset.labels, pred)
             acc, nmi, f1, ari, new_pred = metrics.evaluateFromLabel(use_acc=True)
             if nmi > best_cluster['nmi']:
@@ -82,10 +113,22 @@ def train(args):
     print(args)
 
     save_path = './output/%s.result' % args.dataset
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     f = open(save_path, 'a')
     f.write(f"lr={args.lr}, embed_dim={args.embed_dim}, se_lamda={args.se_lamda}, lp_lamda={args.lp_lamda}, k={args.k}, dropout={args.dropout}, beta_f={args.beta_f}, epochs={args.epochs}, height={args.height}, num_clusters={args.num_clusters_layer}, verbose={args.verbose}, activation={args.activation}, seed={args.seed} \n")
     f.write(f"--------Best NMI: {best_cluster_result['nmi']}, Best ARI: {best_cluster_result['ari']}, Best Cluster: {best_cluster} \n")
     f.close()
+
+    if args.export_ccts:
+        if final_pred is None:
+            try:
+                final_pred = decoding_from_assignment(model.hard_dic[1])
+            except Exception as e:
+                print(f'Unable to decode final partition from model: {e}')
+                final_pred = torch.tensor(dataset.labels, device=device)
+
+        export_ccts_dataset(dataset, args.dataset, args.ccts_method, final_pred)
+
     return best_cluster
 
 
@@ -99,7 +142,7 @@ def draw_network(dataset):
     dataset.print_statistic()
     model = DeSE(args, dataset.feature, device).to(device)
     model.load_state_dict(torch.load('./save_model/{}_{}_acc.pt'.format(args.dataset, args.num_clusters_layer[0])))
-    s_dic, tree_node_embed_dic, g_dic = model(dataset.adj, dataset.feature)
+    s_dic, tree_node_embed_dic, g_dic = model(dataset.adj, dataset.feature, dataset.degrees)
     pred = decoding_from_assignment(model.hard_dic[1])
     metrics = cluster_metrics(dataset.labels, pred)
     acc, nmi, f1, ari, new_pred = metrics.evaluateFromLabel(use_acc=True)
@@ -126,6 +169,7 @@ def draw_network(dataset):
     fig, ax = plt.subplots(figsize=(10,10))
     scatter = plt.scatter(X_tsne[:, 0], X_tsne[:, 1], c=new_pred, cmap=custom_cmap, s=50)
     plt.axis('off')
+    os.makedirs(os.path.dirname("./figure/"), exist_ok=True)
     plt.savefig("./figure/network_{}_{}.pdf".format(args.dataset, args.num_clusters_layer[0]), bbox_inches='tight')
     plt.savefig("./figure/network_{}_{}.png".format(args.dataset, args.num_clusters_layer[0]), bbox_inches='tight')
 
@@ -138,11 +182,12 @@ def draw_network(dataset):
 
 if __name__ == "__main__":
     args = parse_args()
-    args.dataset = 'Photo'
-    args.save = False
+    args.dataset = 'Cora'
+    args.save = True
+    args.export_ccts = True
     if args.dataset == 'Cora':
-        args.epochs = 600
-        args.verbose = 20
+        args.epochs = 100
+        args.verbose = 1
         args.beta_f = 0.2 # 0.2, w/o feature beta_f=0
         args.dropout = 0.3  # 0.3
         args.embed_dim = 8 #8
@@ -165,14 +210,14 @@ if __name__ == "__main__":
         args.lr = 0.001  #0.001
         args.seed = 262  #262
     elif args.dataset == 'Photo':
-        args.epochs = 800  #800
-        args.verbose = 20
+        args.epochs = 100  #800
+        args.verbose = 1
         args.beta_f = 0.4  #0.4
         args.dropout = 0.05  #0.05
         args.embed_dim = 64  #64
         args.k = 1
         args.num_clusters_layer = [9]  #[9]
-        args.lp_lamda = 0  #5
+        args.lp_lamda = 5  #5
         args.se_lamda = 0.01  #0.01
         args.lr = 0.001 #0.001
         args.seed = 132  #132
@@ -210,5 +255,5 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = True #使得网络相同输入下每次运行的输出固定
     dgl.seed(args.seed)
     train(args)
-    #draw_network(args.dataset)
+    draw_network(args.dataset)
     

@@ -40,5 +40,9 @@ def parse_args():
                         help='Save model or not')
     parser.add_argument('--fig_network', type=bool, default=False,
                         help='Draw network or not')
+    parser.add_argument('--export_ccts', action='store_true',
+                        help='Export dataset and partition files for CCTS explainer.')
+    parser.add_argument('--ccts_method', type=str, default='DeSE',
+                        help='Partition folder name for CCTS explainer (must match CCTS method folder).')
 
     return parser.parse_args()
