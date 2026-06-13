@@ -69,7 +69,7 @@ def train(args):
     for epoch in range(args.epochs):
         t1 = time()
         s_dic, tree_node_embed_dic, g_dic = model(dataset.adj, dataset.feature, dataset.degrees)
-        se_loss = model.calculate_se_loss(s_dic, g_dic[args.height])
+        #se_loss = model.calculate_se_loss(s_dic, g_dic[args.height])
         t2 = time()
         se_loss = model.calculate_se_loss1()
         t3= time()
@@ -186,7 +186,7 @@ if __name__ == "__main__":
     args.save = True
     args.export_ccts = True
     if args.dataset == 'Cora':
-        args.epochs = 100
+        args.epochs = 600
         args.verbose = 1
         args.beta_f = 0.2 # 0.2, w/o feature beta_f=0
         args.dropout = 0.3  # 0.3
