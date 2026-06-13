@@ -1,3 +1,21 @@
+"""
+CCTS: Community-aware Clustering Transparency System
+
+This module provides explainability analysis for graph clustering results. It implements
+the CCTS framework which:
+
+1. Analyzes each predicted community to find representative center nodes
+2. Computes explainable regions around each center using distance-based thresholds
+3. Evaluates precision and error rate of explainable regions
+4. Visualizes communities with cluster-aware layouts and color coding
+5. Generates analysis reports showing how well communities are explained
+
+Key Components:
+- CommunityAnalyzer: Finds best center nodes and distance thresholds for each community
+- plot_ccts_results: Visualizes communities with center nodes and explainable regions
+- compute_cluster_layout: Generates community-aware graph layouts using spring layout + small rings
+"""
+
 import networkx as nx
 import pickle
 import os
@@ -9,12 +27,13 @@ import matplotlib.pyplot as plt
 from scipy.spatial import ConvexHull
 from matplotlib.patches import Polygon, Circle
 
+# Supported clustering methods that can be analyzed
 method=['Louvain','GN','LPA','FN','DeSE']
+# Number of methods being analyzed
 num = 4
-# names = [ 'karate','football', 'personal', 'polblogs', 'polbooks', 'railways','web-spam','road-minnesota','cit-DBLP']
-#            0          1          2           3           4           5         6         7              8
-# names = [ 'karate','football', 'personal', 'polbooks' ,'Cora' ]
+# Dataset names to analyze
 names = ['Cora']
+# Current dataset index
 index = 0
 
 tag=[False,True]
@@ -42,49 +61,147 @@ np.random.seed(42)
 
 
 class CommunityAnalyzer:
-    def __init__(self, G, community_nodes, alpha=1, beta=1, seta=1, if_part=True, if_limit_threshold=True, if_threshold_pruning=True, if_BFS=True):
+    """
+    Analyze communities to find explainable center nodes and distance thresholds.
+    
+    For each community, this class:
+    1. Finds candidate center nodes (high-degree nodes or important hubs)
+    2. For each candidate, computes shortest path distances to all community members
+    3. Searches for optimal distance threshold that maximizes:
+       - Precision: % of threshold-selected nodes that are in the community
+       - Minimizes error rate: % of threshold-selected nodes that are NOT in the community
+    4. Uses an objective function combining alpha*precision - beta*error_rate
+    5. Employs optimization strategies: BFS memoization, threshold pruning, threshold limiting
+    """
+    
+    def __init__(self, G, community_nodes, alpha=1, beta=1, seta=1, if_part=True, 
+                 if_limit_threshold=True, if_threshold_pruning=True, if_BFS=True):
+        """
+        Initialize community analyzer for a single community.
+        
+        Args:
+            G (networkx.Graph): The full graph
+            community_nodes (list): Node IDs belonging to this community
+            alpha (float): Weight for precision in objective function (default: 1)
+            beta (float): Weight for error rate in objective function (default: 1)
+            seta (float): Range constraint for threshold search (default: 1)
+            if_part (bool): Use only important nodes as candidates (default: True)
+            if_limit_threshold (bool): Limit threshold search range between communities (default: True)
+            if_threshold_pruning (bool): Early exit if score decreases (default: True)
+            if_BFS (bool): Use BFS with memoization for efficiency (default: True)
+        """
         self.G = G
         self.community_nodes = community_nodes
+        # Precision weight: higher alpha emphasizes including true community members
         self.alpha = alpha
+        # Error rate weight: higher beta penalizes including false members
         self.beta = beta
+        # Threshold search constraint: limits how far threshold can be from previous community
         self.seta = seta
+        # Use only high-degree nodes as candidate centers
         self.if_part = if_part
+        # Limit threshold search range for consistency across communities
         self.if_limit_threshold = if_limit_threshold
+        # Enable early stopping when objective function score decreases
         self.if_threshold_pruning = if_threshold_pruning
+        # Use BFS with dynamic programming for efficiency
         self.if_BFS = if_BFS
 
     def calculate_precision_and_error_rate(self, community_nodes, threshold_nodes):
-        """Calculate precision and error rate"""
+        """
+        Calculate precision and error rate of a threshold selection.
+        
+        Precision = (# threshold nodes in community) / (# community nodes)
+        Error rate = (# threshold nodes NOT in community) / (# threshold nodes)
+        
+        Args:
+            community_nodes (list): True community member IDs
+            threshold_nodes (set): Node IDs selected by distance threshold
+        
+        Returns:
+            precision (float): Fraction of community members correctly identified [0, 1]
+            error_rate (float): Fraction of false positives in selection [0, 1]
+        """
+        # Count nodes that are both in community and selected by threshold
         correct_count = sum(1 for node in community_nodes if node in threshold_nodes)
+        # Precision: how many true community members we captured
         precision = correct_count / len(community_nodes) if community_nodes else 0
-        # incorrect_nodes = [node for node in threshold_nodes if node not in community_nodes]
-        # incorrect_nodes =
-        # error_rate = len(incorrect_nodes) / len(threshold_nodes) if threshold_nodes else 0
+        # Error rate: how many false positives in our selection
         error_rate = (len(threshold_nodes)-correct_count) / len(threshold_nodes) if threshold_nodes else 0
-        # return precision, error_rate, incorrect_nodes
         return precision, error_rate
 
 
     def objective_function(self, precision, error_rate):
-        """Objective function: prefer smaller thresholds"""
+        """
+        Compute objective score for a threshold configuration.
+        
+        Objective = alpha * precision - beta * error_rate
+        
+        Balances two goals:
+        - Maximize precision: include as many true community members as possible
+        - Minimize error rate: avoid including non-community nodes
+        
+        Args:
+            precision (float): Fraction of true community members captured
+            error_rate (float): Fraction of false positives in threshold region
+        
+        Returns:
+            score (float): Objective value (higher is better)
+        """
         return self.alpha * precision - self.beta * error_rate
 
     def find_best_center_and_threshold(self):
+        """
+        Find optimal center node and distance threshold for this community.
+        
+        Algorithm:
+        1. Select candidate center nodes (high-degree nodes if if_part=True)
+        2. For each candidate:
+           a. Compute shortest path distances from candidate to all nodes
+           b. Find maximum distance to any community member
+           c. Search distance thresholds from 1 to max_distance
+           d. For each threshold, select all nodes within that distance
+           e. Evaluate precision and error_rate
+           f. Track best threshold with highest objective score
+        3. Return best center node, threshold, and evaluation metrics
+        
+        Optimizations:
+        - if_threshold_pruning: Stop threshold search if score decreases
+        - if_BFS: Build distance layers incrementally instead of recomputing each threshold
+        - if_limit_threshold: Limit search range based on center_threshold
+        
+        Returns:
+            best_score (float): Objective function value at best threshold
+            best_precision (float): Precision at best threshold
+            final_error_rate (float): Error rate at best threshold
+            best_center_node (int): Selected center node ID
+            best_threshold (int): Selected distance threshold (hops)
+            proportion (float): Fraction of high-degree nodes used as candidates
+            final_threshold_nodes (set): All nodes within best distance threshold
+        """
         best_center_node = None
         best_threshold = None
         final_threshold_nodes = None
         best_score = -float('inf')
         center_threshold = -1
-        # Get candidate nodes and partition proportion
+        
+        # Get candidate nodes: if community is large, use only high-degree nodes
         top_nodes, proportion = self.get_top_nodes(len(self.community_nodes))
+        
+        # Try each candidate center node
         for candidate_node in top_nodes:
+            # Compute shortest path distances from candidate to all nodes
             shortest_path_lengths = nx.single_source_shortest_path_length(G, candidate_node)
+            # Find max distance to any community member (upper bound for threshold search)
             max_distance = max(shortest_path_lengths[node] for node in community_nodes if node in shortest_path_lengths)
+            # Determine threshold search range
             left, right = self.determine_threshold_range(max_distance, center_threshold, len(self.community_nodes))
             temp_best_score = 0
+            
             if self.if_BFS:
+                # BFS-based incremental construction of threshold nodes
                 threshold_nodes = set([candidate_node])
-                # Traverse original distance dictionary and store nodes by distance layer
+                # Pre-organize nodes by distance layer for efficient incremental addition
                 distance_layered_dict = {}
                 flag = True
                 for target_node, distance in shortest_path_lengths.items():
@@ -92,24 +209,30 @@ class CommunityAnalyzer:
                         distance_layered_dict[distance] = []
                     distance_layered_dict[distance].append(target_node)
 
+            # Try each distance threshold
             for threshold in range(left, right):
-                # Memoized BFS, dynamic programming
+                # Memoized BFS: incrementally add nodes at each distance layer
                 if self.if_BFS:
                     if flag:
+                        # First iteration: add all nodes up to this threshold
                         new_nodes = []
                         for dist in range(1, threshold + 1):
                             if dist in distance_layered_dict:
                                 new_nodes.extend(distance_layered_dict[dist])
                         flag = False
                     else:
+                        # Subsequent iterations: only add new layer
                         new_nodes = distance_layered_dict[threshold]
                     threshold_nodes.update(new_nodes)
                 else:
+                    # Non-BFS: recompute from scratch each time
                     threshold_nodes = [node for node, distance in shortest_path_lengths.items() if distance <= threshold]
 
+                # Evaluate this threshold
                 precision, error_rate = self.calculate_precision_and_error_rate(self.community_nodes, threshold_nodes)
                 current_score = self.objective_function(precision, error_rate)
 
+                # Update best if this threshold is better
                 if current_score > best_score or (current_score == best_score and threshold < best_threshold and best_threshold is None):
                     best_precision = precision
                     final_error_rate = error_rate
@@ -117,78 +240,163 @@ class CommunityAnalyzer:
                     best_score = current_score
                     best_center_node = candidate_node
                     best_threshold = threshold
-                    # Use threshold limiting
+                    # Update threshold range for next community
                     if if_limit_threshold == True:
                         center_threshold = threshold
-                # Threshold pruning
+                
+                # Threshold pruning: stop if score decreases
                 if if_threshold_pruning == True:
                     if current_score > temp_best_score:
                         temp_best_score = current_score
                     else:
-                            break
+                        break
+                
+                # Early stopping if perfect precision achieved
                 if precision == 1.0:
                     break
 
         return best_score, best_precision, final_error_rate, best_center_node, best_threshold, proportion, final_threshold_nodes
 
     def get_top_nodes(self, num_nodes):
-        """Determine the proportion based on community size and filter eligible nodes"""
+        """
+        Get candidate center nodes, filtering by importance if community is large.
+        
+        For large communities (>100 nodes), uses only high-degree nodes as candidates
+        to reduce computation. For small communities, uses all members.
+        
+        Args:
+            num_nodes (int): Number of nodes in community
+        
+        Returns:
+            top_nodes (list): Candidate center node IDs
+            proportion (float): Fraction of community used as candidates
+        """
         if self.if_part and num_nodes > 100:
-            # Code to select important nodes in the community can be added here
+            # Use only important (high-degree) nodes for large communities
             return self.find_top_nodes()
         else:
+            # Use all community members for small communities
             return self.community_nodes, 1
 
     # Determine proportion based on community size
     def determine_proportion(self, community_size, max_community_size, min_proportion=0.05):
-        # Use a sigmoid function to adjust proportion so smaller communities have higher proportions and larger communities have lower proportions
-        # Here we adjust the sigmoid function so it begins to drop quickly when community size approaches half of max_community_size
-        k = 5 / max_community_size  # Control the steepness of the curve
-        x0 = max_community_size / 2  # Control the horizontal shift of the curve; here set to half the maximum community size
+        """
+        Dynamically determine proportion of nodes to use based on community size.
+        
+        Uses sigmoid function: smaller communities use more candidate nodes (higher proportion),
+        larger communities use fewer (lower proportion) for computational efficiency.
+        
+        Args:
+            community_size (int): Size of current community
+            max_community_size (int): Size of largest community in dataset
+            min_proportion (float): Minimum proportion to always use (default: 0.05)
+        
+        Returns:
+            proportion (float): Fraction of community nodes to use as candidates [min_proportion, 1.0]
+        """
+        # Sigmoid parameters: control steepness and midpoint
+        k = 5 / max_community_size  # Steepness: larger k = sharper transition
+        x0 = max_community_size / 2  # Midpoint: shift to half max size
+        # Sigmoid: min_proportion + (1 - 1/(1 + exp(-k(x-x0))))
         proportion = min(1.0, min_proportion + (1 - 1 / (1 + math.exp(-k * (community_size - x0)))))
-
         return proportion
 
 
     # Filter eligible nodes by proportion
     def find_top_nodes(self):
-        # Sort by node degree
+        """
+        Select high-degree nodes as candidate centers for large communities.
+        
+        Sorts community members by degree and selects top-k nodes where k is
+        determined by the proportion calculation.
+        
+        Returns:
+            top_nodes (list): Selected high-degree node IDs
+            proportion (float): Fraction of community used
+        """
+        # Compute degree for each community node
         degree_dict = {node: self.G.degree(node) for node in community_nodes}
-        sorted_nodes = sorted(degree_dict, key=degree_dict.get, reverse=True)  # Sort by degree descending
+        # Sort by degree descending
+        sorted_nodes = sorted(degree_dict, key=degree_dict.get, reverse=True)
         # Calculate the node selection proportion
         proportion = self.determine_proportion(len(community_nodes), max_community_size)
         # Calculate the number of nodes to take
-        num_top_nodes = max(100, int(len(sorted_nodes) * proportion))  # Ensure at least one node
+        num_top_nodes = max(100, int(len(sorted_nodes) * proportion))  # Ensure at least 100 nodes
         # Take only the high-degree nodes
         top_nodes = sorted_nodes[:num_top_nodes]
         # print(f'Total: {len(community_nodes)}, selected: {len(top_nodes)}, partition proportion: {proportion * 100:.2f}%')
         return top_nodes, proportion
 
     def determine_threshold_range(self, max_distance, center_threshold, num_nodes):
-        """Determine threshold search range"""
+        """
+        Determine the range of distances to search for optimal threshold.
+        
+        Can limit search range for consistency:
+        - Without limiting: search from 1 to max_distance
+        - With limiting: search around previous community's threshold
+        
+        Args:
+            max_distance (int): Maximum distance to any community member
+            center_threshold (int): Threshold of previous community (-1 if first community)
+            num_nodes (int): Size of community
+        
+        Returns:
+            left (int): Minimum threshold to try
+            right (int): Maximum threshold to try (exclusive)
+        """
+        # Limit threshold range for larger communities if specified
         if self.if_limit_threshold and center_threshold != -1 and num_nodes > 100:
+            # Search near previous community's threshold: [center-seta, center+seta]
             left = max(1, center_threshold - self.seta)
             right = min(center_threshold + self.seta, max_distance + 1)
         else:
+            # Full range: 1 to max_distance
             left = 1
             right = max_distance + 1
         return left, right
 
 
 def plot_ccts_results(G, community_results, current_method, dataset_name):
+    """
+    Visualize clustering results with community-aware layouts.
+    
+    Creates multiple visualizations:
+    1. Community size and threshold bar/line chart
+    2. Full graph visualization for top 10 largest communities with:
+       - Overlapping nodes (purple): In both community and explainable region
+       - Community-only nodes (blue): In community but outside explainable region
+       - Threshold-only nodes (red): In explainable region but outside community
+       - Other nodes (gray): Not in either region
+    
+    Args:
+        G (networkx.Graph): The full graph
+        community_results (list): List of community analysis results with keys:
+            - 'community_id': Community identifier
+            - 'node_count': Number of nodes in community
+            - 'threshold': Distance threshold for explainable region
+            - 'original_nodes': Nodes belonging to community
+            - 'all_nodes_in_explainable_region': Nodes in threshold region
+        current_method (str): Method name (e.g., 'DeSE')
+        dataset_name (str): Dataset name (e.g., 'Cora')
+    """
+    # Create output directory for results
     result_dir = os.path.join('result', current_method)
     os.makedirs(result_dir, exist_ok=True)
 
+    # Extract data from results
     ids = [result['community_id'] for result in community_results]
     sizes = [result['node_count'] for result in community_results]
     thresholds = [result['threshold'] for result in community_results]
 
+    # Create bar + line plot: community sizes and thresholds
     fig, ax1 = plt.subplots(figsize=(10, 5))
+    # Bar plot for node counts
     ax1.bar(ids, sizes, color='skyblue', label='Node count')
     ax1.set_xlabel('Community ID')
     ax1.set_ylabel('Node count', color='blue')
     ax1.tick_params(axis='y', labelcolor='blue')
 
+    # Line plot for thresholds (dual y-axis)
     ax2 = ax1.twinx()
     ax2.plot(ids, thresholds, color='orange', marker='o', label='Threshold')
     ax2.set_ylabel('Threshold', color='orange')
@@ -199,71 +407,110 @@ def plot_ccts_results(G, community_results, current_method, dataset_name):
     fig.savefig(os.path.join(result_dir, f'{dataset_name}_community_stats.png'))
     plt.close(fig)
 
+    # Visualize individual communities
     if community_results:
         all_nodes = list(G.nodes())
+        # Compute spring layout for consistent visualization
         if len(all_nodes) > 1:
+            # Use cluster-aware layout with small radius
             pos = nx.spring_layout(G, seed=42, k=2.0 / math.sqrt(len(all_nodes)), iterations=2000)
         else:
+            # Single node: place at origin
             pos = {n: (0, 0) for n in all_nodes}
 
+        # Visualize top 10 largest communities
         max_plots = min(len(community_results), 10)
         visualize_results = sorted(community_results, key=lambda r: r['node_count'], reverse=True)[:max_plots]
 
         for result in visualize_results:
+            # Get node sets from result
             comm_nodes = set(result['original_nodes'])
             threshold_nodes = set(result['all_nodes_in_explainable_region'] or [])
-            overlap_nodes = comm_nodes & threshold_nodes
-            community_only = comm_nodes - threshold_nodes
-            threshold_only = threshold_nodes - comm_nodes
+            # Compute different node categories
+            overlap_nodes = comm_nodes & threshold_nodes  # Both
+            community_only = comm_nodes - threshold_nodes  # Community but not threshold
+            threshold_only = threshold_nodes - comm_nodes  # Threshold but not community
 
+            # Color code nodes by category
             colors = []
             sizes = []
             alphas = []
             for node in all_nodes:
                 if node in overlap_nodes:
+                    # Overlap: both in community and explainable region (good!)
                     colors.append('#9467bd')
                     sizes.append(220)
                     alphas.append(0.95)
                 elif node in community_only:
+                    # Community only: not explained by threshold region
                     colors.append('#1f77b4')
                     sizes.append(180)
                     alphas.append(0.85)
                 elif node in threshold_only:
+                    # Threshold only: false positive in explainable region
                     colors.append('#d62728')
                     sizes.append(120)
                     alphas.append(0.75)
                 else:
+                    # Other: not relevant to this community
                     colors.append('#cccccc')
                     sizes.append(50)
                     alphas.append(0.25)
 
+            # Create large high-quality visualization
             fig = plt.figure(figsize=(28, 28), dpi=300)
             ax = fig.add_subplot(1, 1, 1)
+            # Draw edges
             nx.draw_networkx_edges(G, pos=pos, ax=ax, edge_color='#bbbbbb', alpha=0.15, width=0.5)
-            nx.draw_networkx_nodes(G, pos=pos, ax=ax, node_color=colors, node_size=sizes, alpha=0.85, linewidths=0.3, edgecolors='black')
+            # Draw nodes with color coding
+            nx.draw_networkx_nodes(G, pos=pos, ax=ax, node_color=colors, node_size=sizes, 
+                                   alpha=0.85, linewidths=0.3, edgecolors='black')
 
+            # Add node labels for small graphs
             if len(all_nodes) <= 200:
                 nx.draw_networkx_labels(G, pos=pos, ax=ax, font_size=6, font_color='black')
 
             ax.set_title(f'{dataset_name} Community {result["community_id"]}: overlap with explainable region', fontsize=26)
             ax.set_axis_off()
             plt.tight_layout()
+            # Save visualization
             out_path = os.path.join(result_dir, f'{dataset_name}_community_{result["community_id"]}_full_graph.png')
             plt.savefig(out_path, dpi=300)
             plt.close()
 
-def compute_cluster_layout(G, partition, community_results=None):
-    """Compute a cluster-aware initial layout then refine with a global spring layout.
 
-    The approach places communities near soft centers (small radius) to keep
-    related nodes together, then runs a global spring refinement with the
-    initial positions to produce a natural-looking graph while preserving
-    readability.
+def compute_cluster_layout(G, partition, community_results=None):
     """
+    Compute cluster-aware layout for graph visualization.
+    
+    Combines two-stage layout strategy:
+    1. **Initial stage**: Places each community at a global position determined by:
+       - Community centers arranged in a circle for clear separation
+       - Within each community: small local arrangements to keep cohesion
+    2. **Refinement stage** (implicit): Spring forces can be applied for smoothing
+    
+    For small communities (≤30 nodes): Arrange on a small circular ring around community center
+    For large communities (>30 nodes): Compute local spring layout within community bounds
+    
+    This approach balances:
+    - Preserving community structure (nodes in same community stay close)
+    - Readability (communities clearly separated in global layout)
+    - Visualization quality (spring forces create natural-looking layouts)
+    
+    Args:
+        G (networkx.Graph): The full graph
+        partition (dict): Node -> community ID mapping
+        community_results (list, optional): Community analysis results containing center nodes
+    
+    Returns:
+        pos (dict): Node -> (x, y) position coordinates for visualization
+    """
+    # Organize nodes by community
     communities = {}
     for node, comm in partition.items():
         communities.setdefault(comm, []).append(node)
 
+    # Extract representative (center) nodes from community results
     rep_nodes = set()
     if community_results:
         for r in community_results:
@@ -271,52 +518,73 @@ def compute_cluster_layout(G, partition, community_results=None):
             if cn is not None:
                 rep_nodes.add(cn)
 
+    # Get sorted list of community IDs
     comm_list = sorted(communities.keys())
     num_comms = len(comm_list)
     N = max(1, G.number_of_nodes())
 
-    # Use a small radius so communities are not overly separated
+    # ============ GLOBAL LAYOUT: Place communities in circle ============
+    # Use a small radius so communities don't spread too far apart
+    # Radius scales with number of communities
     radius = max(6.0, 6.0 * math.sqrt(max(1, num_comms) / 4.0))
 
-    # Place community centers on a small circle
+    # Place community centers on a circle
     comm_centers = {}
     for idx, comm in enumerate(comm_list):
+        # Evenly distribute communities around circle
         theta = 2 * math.pi * idx / max(1, num_comms)
         comm_centers[comm] = (radius * math.cos(theta), radius * math.sin(theta))
 
     pos = {}
+    
+    # ============ LOCAL LAYOUT: Position nodes within each community ============
     for comm in comm_list:
         nodes = communities[comm]
-        k = len(nodes)
-        cx, cy = comm_centers[comm]
+        k = len(nodes)  # Community size
+        cx, cy = comm_centers[comm]  # Community center position
 
         if k == 1:
+            # Single node: place exactly at community center
             pos[nodes[0]] = (cx, cy)
             continue
 
-        # For small communities, arrange on a small local ring
+        # ---- For small communities: arrange in circular ring ----
         if k <= 30:
+            # Ring radius increases with community size
             ring_r = 1.2 + math.sqrt(k) * 0.6
+            # Distribute nodes evenly around a circle centered at (cx, cy)
             for j, n in enumerate(nodes):
                 angle = 2 * math.pi * j / k
                 pos[n] = (cx + ring_r * math.cos(angle), cy + ring_r * math.sin(angle))
             continue
 
-        # For larger communities, compute a compact local spring layout
+        # ---- For large communities: compute local spring layout ----
+        # Extract subgraph containing only this community's nodes
         subG = G.subgraph(nodes)
         try:
+            # Compute spring layout within this subgraph
             local_pos = nx.spring_layout(subG, seed=42, k=0.5, iterations=200)
         except Exception:
+            # Fallback: random positions if spring layout fails
             local_pos = {n: (random.random(), random.random()) for n in nodes}
 
+        # Compute bounding box of local layout
         xs = [p[0] for p in local_pos.values()]
         ys = [p[1] for p in local_pos.values()]
         minx, maxx = min(xs), max(xs)
         miny, maxy = min(ys), max(ys)
+        
+        # Compute dimensions of local layout
         span_x = max(1.0, maxx - minx)
         span_y = max(1.0, maxy - miny)
+        
+        # Scale factor: larger communities take more space locally
         scale = 1.6 + math.sqrt(k) * 0.5
 
+        # Transform local positions to global coordinates
+        # 1. Normalize to [0, 1]
+        # 2. Scale by 'scale' factor
+        # 3. Center at community center (cx, cy)
         for n, p in local_pos.items():
             nxp = (p[0] - minx) / span_x * scale - scale / 2.0
             nyp = (p[1] - miny) / span_y * scale - scale / 2.0
